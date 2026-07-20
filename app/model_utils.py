@@ -65,6 +65,21 @@ def load_and_preprocess(image_bytes: bytes) -> tuple[np.ndarray, Image.Image]:
     return arr, img
 
 
+def looks_like_xray(img: Image.Image) -> bool:
+    """
+    Rough sanity check: chest X-rays are effectively grayscale (R, G, B channels
+    are nearly identical at every pixel). Most non-X-ray photos are properly
+    colorful. This will NOT catch every wrong image (e.g. a grayscale photo of
+    something else would pass), but it filters out an easy, common case cheaply
+    without needing a second trained model.
+    """
+    small = img.convert("RGB").resize((64, 64))
+    arr = np.array(small).astype("float32")
+    r, g, b = arr[..., 0], arr[..., 1], arr[..., 2]
+    channel_spread = (np.abs(r - g) + np.abs(g - b) + np.abs(r - b)).mean()
+    return channel_spread < 12.0  # tuned loosely; lower = stricter
+
+
 def predict(arr: np.ndarray) -> dict:
     model = get_model()
     score = float(model.predict(arr, verbose=0)[0][0])
