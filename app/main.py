@@ -63,9 +63,18 @@ async def predict_xray(file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail="Empty file uploaded.")
 
     try:
-        arr, _ = model_utils.load_and_preprocess(raw_bytes)
+        arr, pil_img = model_utils.load_and_preprocess(raw_bytes)
     except Exception:
         raise HTTPException(status_code=400, detail="Could not read the uploaded image.")
+
+    if not model_utils.looks_like_xray(pil_img):
+        return PredictResponse(
+            prediction="Invalid",
+            confidence=0.0,
+            raw_score=0.0,
+            heatmap_base64="",
+            model_used="Pre-check (image does not resemble a grayscale X-ray)",
+        )
 
     result = model_utils.predict(arr)
     heatmap_b64 = model_utils.generate_gradcam(arr)
