@@ -1,9 +1,8 @@
 """
 MedVision FastAPI backend.
 
-Replaces the placeholder Gemini-based `analyze-xray` Supabase edge function with a
-real inference service backed by a trained MobileNetV2 model + Grad-CAM explainability,
-as described in the project report.
+Serves the team-trained 3-class MobileNetV2 model (Bacterial / Normal / Viral) with
+Grad-CAM explainability.
 """
 
 import os
@@ -14,10 +13,8 @@ from pydantic import BaseModel
 
 from . import model_utils
 
-app = FastAPI(title="MedVision API", version="1.0.0")
+app = FastAPI(title="MedVision API", version="2.0.0")
 
-# Allow the Vite/React frontend (and Supabase edge functions, if proxied through them)
-# to call this API. Tighten allow_origins to your deployed frontend URL(s) in production.
 ALLOWED_ORIGINS = os.environ.get("MEDVISION_ALLOWED_ORIGINS", "*").split(",")
 
 app.add_middleware(
@@ -35,14 +32,13 @@ MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024  # 10 MB
 class PredictResponse(BaseModel):
     prediction: str
     confidence: float
-    raw_score: float
+    class_probabilities: dict[str, float] = {}
     heatmap_base64: str
-    model_used: str = "MobileNetV2 (transfer learning, fine-tuned)"
+    model_used: str = "MobileNetV2 (3-class: Bacterial/Normal/Viral, fine-tuned)"
 
 
 @app.on_event("startup")
 def _warm_up_model():
-    # Load the model once at startup rather than on the first request.
     model_utils.get_model()
 
 
@@ -71,7 +67,7 @@ async def predict_xray(file: UploadFile = File(...)):
         return PredictResponse(
             prediction="Invalid",
             confidence=0.0,
-            raw_score=0.0,
+            class_probabilities={},
             heatmap_base64="",
             model_used="Pre-check (image does not resemble a grayscale X-ray)",
         )
@@ -82,6 +78,6 @@ async def predict_xray(file: UploadFile = File(...)):
     return PredictResponse(
         prediction=result["prediction"],
         confidence=result["confidence"],
-        raw_score=result["raw_score"],
+        class_probabilities=result["class_probabilities"],
         heatmap_base64=heatmap_b64,
     )
