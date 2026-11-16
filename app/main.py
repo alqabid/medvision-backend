@@ -1,19 +1,21 @@
 """
 MedVision FastAPI backend.
 
-Serves the team-trained 3-class MobileNetV2 model (Bacterial / Normal / Viral) with
-Grad-CAM explainability.
+Serves the team-trained MobileNetV2 models for Chest X-ray (3-class pneumonia:
+Bacterial / Normal / Viral) and Chest CT (4-class lung cancer: Adenocarcinoma /
+Large Cell Carcinoma / Normal / Squamous Cell Carcinoma) with Grad-CAM explainability.
 """
 
 import os
+from typing import Literal
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from . import model_utils
 
-app = FastAPI(title="MedVision API", version="2.0.0")
+app = FastAPI(title="MedVision API", version="2.1.0")
 
 ALLOWED_ORIGINS = os.environ.get("MEDVISION_ALLOWED_ORIGINS", "*").split(",")
 
@@ -30,25 +32,40 @@ MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024  # 10 MB
 
 
 class PredictResponse(BaseModel):
+    modality: Literal["xray", "ct"] = "xray"
     prediction: str
     confidence: float
     class_probabilities: dict[str, float] = {}
     heatmap_base64: str
-    model_used: str = "MobileNetV2 (3-class: Bacterial/Normal/Viral, fine-tuned)"
+    model_used: str
 
 
 @app.on_event("startup")
-def _warm_up_model():
-    model_utils.get_model()
+def _warm_up_models():
+    model_utils.warm_up_available_models()
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        "modalities": model_utils.modality_status(),
+    }
 
 
 @app.post("/predict", response_model=PredictResponse)
-async def predict_xray(file: UploadFile = File(...)):
+async def predict_scan(
+    file: UploadFile = File(...),
+    modality: Literal["xray", "ct"] = Form("xray"),
+):
+    bundle = model_utils.get_bundle(modality)
+    if not bundle.exists():
+        label = "Chest CT" if modality == "ct" else "Chest X-ray"
+        raise HTTPException(
+            status_code=503,
+            detail=f"{label} model ({os.path.basename(bundle.model_path)}) is not deployed on this server.",
+        )
+
     if file.content_type not in ALLOWED_CONTENT_TYPES:
         raise HTTPException(status_code=400, detail="Please upload a JPEG or PNG image.")
 
@@ -63,21 +80,25 @@ async def predict_xray(file: UploadFile = File(...)):
     except Exception:
         raise HTTPException(status_code=400, detail="Could not read the uploaded image.")
 
-    if not model_utils.looks_like_xray(pil_img):
+    if not model_utils.looks_like_medical_scan(pil_img):
+        scan_label = "CT scan" if modality == "ct" else "X-ray"
         return PredictResponse(
+            modality=modality,
             prediction="Invalid",
             confidence=0.0,
             class_probabilities={},
             heatmap_base64="",
-            model_used="Pre-check (image does not resemble a grayscale X-ray)",
+            model_used=f"Pre-check (image does not resemble a grayscale {scan_label})",
         )
 
-    result = model_utils.predict(arr)
-    heatmap_b64 = model_utils.generate_gradcam(arr)
+    result = bundle.predict(arr)
+    heatmap_b64 = bundle.generate_gradcam(arr)
 
     return PredictResponse(
+        modality=modality,
         prediction=result["prediction"],
         confidence=result["confidence"],
         class_probabilities=result["class_probabilities"],
         heatmap_base64=heatmap_b64,
+        model_used=bundle.display_name,
     )

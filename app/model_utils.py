@@ -1,101 +1,222 @@
 """
 Model loading, preprocessing, prediction, and Grad-CAM utilities for MedVision.
 
-Model provenance
------------------
-model/pneumonia_mobilenetv2_3class.h5 is a MobileNetV2 transfer-learning classifier,
-trained by the project team specifically for this report, distinguishing 3 classes:
-Bacterial Pneumonia, Normal, Viral Pneumonia (in that alphabetical order -- Keras assigns
-label indices alphabetically by folder name).
+Supports two chest imaging modalities via per-modality ModelBundle instances:
 
-Trained on the Kermany chest X-ray dataset (via Kaggle: paultimothymooney/chest-xray-pneumonia),
-with pneumonia images split into Bacterial/Viral using filename metadata. Two-stage training:
-frozen-base head training, then fine-tuning of the last ~30 MobileNetV2 layers.
+1. Chest X-ray ("xray") — model/pneumonia_mobilenetv2_3class.h5
+   - MobileNetV2 transfer-learning classifier distinguishing 3 classes:
+     ["Bacterial", "Normal", "Viral"] (alphabetical order, matching Keras folder indices).
+   - Trained on the Kermany chest X-ray dataset (Kaggle: paultimothymooney/chest-xray-pneumonia),
+     with pneumonia images split into Bacterial/Viral using filename metadata.
+   - Known limitation: Viral pneumonia recall (~48%) is lower than Bacterial (~87%) and
+     Normal (~91%) due to ~2:1 Bacterial-to-Viral class imbalance in the training data.
 
-Known limitation (documented, not hidden): Viral pneumonia recall is notably lower (~48%)
-than Bacterial (~87%) and Normal (~91%), largely due to class imbalance in the training
-data (Bacterial images outnumbered Viral roughly 2:1). The model tends to default to
-"Bacterial" on ambiguous pneumonia cases. See project report for full evaluation metrics
-and confusion matrix.
+2. Chest CT ("ct") — model/ct_mobilenetv2_4class.h5
+   - MobileNetV2 transfer-learning classifier distinguishing 4 classes:
+     ["Adenocarcinoma", "Large Cell Carcinoma", "Normal", "Squamous Cell Carcinoma"]
+     (alphabetical order, matching training).
+   - Trained on the Kaggle Chest CT-Scan Images dataset (mohamedhanyyy/chest-ctscan-images),
+     which is a lung-cancer CT dataset (NOT pneumonia CT).
 
-Architecture: MobileNetV2 is saved as a *nested* Functional submodel inside the outer model
-(not flattened), so Grad-CAM needs to reach inside it explicitly -- see generate_gradcam().
+Architecture & Grad-CAM
+-----------------------
+In both models, MobileNetV2 ("mobilenetv2_1.00_224", last conv layer "out_relu") is saved
+as a *nested* Functional submodel inside the outer model (not flattened). Grad-CAM builds
+two submodels per bundle:
+  1. last_conv_layer_model: image -> last conv layer's feature maps
+  2. classifier_model: feature maps -> final prediction through the outer head layers
 
-Preprocessing: resize to 224x224, rescale to [0, 1] (matches training pipeline).
+Preprocessing: resize to 224x224 RGB, rescale to [0, 1] (not preprocess_input).
 """
 
-import io
 import base64
+from dataclasses import dataclass, field
+import io
 import os
+from typing import Literal
 
 import numpy as np
 from PIL import Image
 import tensorflow as tf
 from tensorflow import keras
 
-MODEL_PATH = os.path.join(os.path.dirname(__file__), "..", "model", "pneumonia_mobilenetv2_3class.h5")
+Modality = Literal["xray", "ct"]
+
+MODEL_DIR = os.path.join(os.path.dirname(__file__), "..", "model")
 IMG_SIZE = (224, 224)
-BASE_MODEL_LAYER_NAME = "mobilenetv2_1.00_224"  # nested MobileNetV2 submodel
-LAST_CONV_LAYER_NAME = "out_relu"  # last conv activation, inside the nested submodel
-HEAD_LAYER_NAMES = ["global_average_pooling2d", "dense", "dropout", "dense_1"]
-CLASS_NAMES = ["Bacterial", "Normal", "Viral"]  # alphabetical order, matches training
-
-_model = None
-_last_conv_layer_model = None
-_classifier_model = None
 
 
-def get_model():
-    global _model
-    if _model is None:
-        _model = keras.models.load_model(MODEL_PATH, compile=False)
-    return _model
+@dataclass
+class ModelBundle:
+    modality: Modality
+    model_path: str
+    class_names: list[str]
+    display_name: str
+    base_model_layer_name: str = "mobilenetv2_1.00_224"
+    last_conv_layer_name: str = "out_relu"
+    head_layer_names: list[str] = field(default_factory=list)
+    _model: keras.Model | None = field(default=None, init=False, repr=False)
+    _last_conv_layer_model: keras.Model | None = field(default=None, init=False, repr=False)
+    _classifier_model: keras.Model | None = field(default=None, init=False, repr=False)
+
+    def exists(self) -> bool:
+        return os.path.isfile(self.model_path)
+
+    def get_model(self) -> keras.Model:
+        if not self.exists():
+            self._model = None
+            self._last_conv_layer_model = None
+            self._classifier_model = None
+            raise FileNotFoundError(
+                f"Model file for modality '{self.modality}' not found at {self.model_path}"
+            )
+        if self._model is None:
+            self._model = keras.models.load_model(self.model_path, compile=False)
+        return self._model
+
+    def _get_gradcam_submodels(self) -> tuple[keras.Model, keras.Model]:
+        """
+        Build two small models for Grad-CAM:
+          1. last_conv_layer_model: image -> last conv layer's feature maps (inside the
+             nested MobileNetV2 submodel)
+          2. classifier_model: those feature maps -> final prediction (replays the outer
+             model's head layers: GAP -> Dense -> Dropout -> Dense)
+        """
+        model = self.get_model()
+        if self._last_conv_layer_model is not None and self._classifier_model is not None:
+            return self._last_conv_layer_model, self._classifier_model
+
+        base_model = model.get_layer(self.base_model_layer_name)
+        last_conv_layer = base_model.get_layer(self.last_conv_layer_name)
+
+        self._last_conv_layer_model = keras.Model(base_model.input, last_conv_layer.output)
+
+        classifier_input = keras.Input(shape=last_conv_layer.output.shape[1:])
+        x = classifier_input
+        for layer_name in self.head_layer_names:
+            x = model.get_layer(layer_name)(x)
+        self._classifier_model = keras.Model(classifier_input, x)
+
+        return self._last_conv_layer_model, self._classifier_model
+
+    def predict(self, arr: np.ndarray) -> dict:
+        model = self.get_model()
+        probs = model.predict(arr, verbose=0)[0]
+        class_idx = int(np.argmax(probs))
+        label = self.class_names[class_idx]
+        confidence = float(probs[class_idx])
+        return {
+            "prediction": label,
+            "confidence": round(confidence * 100, 2),
+            "class_probabilities": {
+                self.class_names[i]: round(float(probs[i]) * 100, 2)
+                for i in range(len(self.class_names))
+            },
+        }
+
+    def generate_gradcam(self, arr: np.ndarray) -> str:
+        """Run Grad-CAM (against the predicted class) and return a base64-encoded PNG overlay."""
+        last_conv_layer_model, classifier_model = self._get_gradcam_submodels()
+
+        with tf.GradientTape() as tape:
+            conv_outputs = last_conv_layer_model(arr)
+            tape.watch(conv_outputs)
+            predictions = classifier_model(conv_outputs)
+            class_idx = tf.argmax(predictions[0])
+            loss = predictions[:, class_idx]
+
+        grads = tape.gradient(loss, conv_outputs)
+        pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
+
+        conv_outputs = conv_outputs[0]
+        heatmap = conv_outputs @ pooled_grads[..., tf.newaxis]
+        heatmap = tf.squeeze(heatmap)
+        heatmap = tf.maximum(heatmap, 0) / (tf.math.reduce_max(heatmap) + 1e-8)
+        heatmap = heatmap.numpy()
+
+        heatmap_img = Image.fromarray(np.uint8(255 * heatmap)).resize(IMG_SIZE)
+        heatmap_arr = np.array(heatmap_img)
+
+        colored = np.zeros((*IMG_SIZE, 3), dtype=np.uint8)
+        colored[..., 0] = heatmap_arr
+        colored[..., 1] = (heatmap_arr * 0.3).astype(np.uint8)
+        heatmap_rgba = Image.fromarray(colored).convert("RGBA")
+
+        alpha = Image.fromarray(np.uint8(heatmap_arr * 0.6))
+        heatmap_rgba.putalpha(alpha)
+
+        orig_img = Image.fromarray(np.uint8(arr[0] * 255)).convert("RGBA").resize(IMG_SIZE)
+        overlay = Image.alpha_composite(orig_img, heatmap_rgba).convert("RGB")
+
+        buf = io.BytesIO()
+        overlay.save(buf, format="PNG")
+        return base64.b64encode(buf.getvalue()).decode("utf-8")
 
 
-def _get_gradcam_submodels():
+BUNDLES: dict[Modality, ModelBundle] = {
+    "xray": ModelBundle(
+        modality="xray",
+        model_path=os.path.join(MODEL_DIR, "pneumonia_mobilenetv2_3class.h5"),
+        class_names=["Bacterial", "Normal", "Viral"],
+        display_name="MobileNetV2 (3-class: Bacterial/Normal/Viral, fine-tuned)",
+        base_model_layer_name="mobilenetv2_1.00_224",
+        last_conv_layer_name="out_relu",
+        head_layer_names=["global_average_pooling2d", "dense", "dropout", "dense_1"],
+    ),
+    "ct": ModelBundle(
+        modality="ct",
+        model_path=os.path.join(MODEL_DIR, "ct_mobilenetv2_4class.h5"),
+        class_names=[
+            "Adenocarcinoma",
+            "Large Cell Carcinoma",
+            "Normal",
+            "Squamous Cell Carcinoma",
+        ],
+        display_name="MobileNetV2 (4-class CT: Adenocarcinoma/Large Cell/Normal/Squamous Cell, fine-tuned)",
+        base_model_layer_name="mobilenetv2_1.00_224",
+        last_conv_layer_name="out_relu",
+        head_layer_names=["gap", "dense_head", "dropout_head", "predictions"],
+    ),
+}
+
+
+def get_bundle(modality: Modality = "xray") -> ModelBundle:
+    if modality not in BUNDLES:
+        raise ValueError(f"Unsupported modality: {modality}")
+    return BUNDLES[modality]
+
+
+def warm_up_available_models() -> dict[str, bool]:
+    status: dict[str, bool] = {}
+    for modality, bundle in BUNDLES.items():
+        if bundle.exists():
+            bundle.get_model()
+            status[modality] = True
+        else:
+            status[modality] = False
+    return status
+
+
+def modality_status() -> dict[str, bool]:
+    return {modality: bundle.exists() for modality, bundle in BUNDLES.items()}
+
+
+def looks_like_medical_scan(img: Image.Image) -> bool:
     """
-    Build two small models for Grad-CAM:
-      1. last_conv_layer_model: image -> last conv layer's feature maps (inside the
-         nested MobileNetV2 submodel)
-      2. classifier_model: those feature maps -> final prediction (replays the outer
-         model's head layers: GAP -> Dense -> Dropout -> Dense)
-
-    This split is necessary because the MobileNetV2 backbone is stored as a *nested*
-    Functional submodel rather than being flattened into the outer model -- you can't
-    directly build Model(inputs=outer.input, outputs=inner_layer.output) across that
-    boundary, it raises a "graph disconnected" error.
-    """
-    global _last_conv_layer_model, _classifier_model
-    if _last_conv_layer_model is not None and _classifier_model is not None:
-        return _last_conv_layer_model, _classifier_model
-
-    model = get_model()
-    base_model = model.get_layer(BASE_MODEL_LAYER_NAME)
-    last_conv_layer = base_model.get_layer(LAST_CONV_LAYER_NAME)
-
-    _last_conv_layer_model = keras.Model(base_model.input, last_conv_layer.output)
-
-    classifier_input = keras.Input(shape=last_conv_layer.output.shape[1:])
-    x = classifier_input
-    for layer_name in HEAD_LAYER_NAMES:
-        x = model.get_layer(layer_name)(x)
-    _classifier_model = keras.Model(classifier_input, x)
-
-    return _last_conv_layer_model, _classifier_model
-
-
-def looks_like_xray(img: Image.Image) -> bool:
-    """
-    Rough sanity check: chest X-rays are effectively grayscale (R, G, B channels are
-    nearly identical at every pixel). Filters out obviously-wrong colorful uploads
-    before they hit the classifier. Will not catch every wrong image (e.g. a grayscale
-    photo of something else), but catches the common case cheaply.
+    Rough sanity check: chest X-rays and CT slices are effectively grayscale (R, G, B
+    channels are nearly identical at every pixel). Filters out obviously-wrong colorful
+    uploads before they hit the classifier. Will not catch every wrong image (e.g. a
+    grayscale photo of something else), but catches the common case cheaply.
     """
     small = img.convert("RGB").resize((64, 64))
     arr = np.array(small).astype("float32")
     r, g, b = arr[..., 0], arr[..., 1], arr[..., 2]
     channel_spread = (np.abs(r - g) + np.abs(g - b) + np.abs(r - b)).mean()
-    return channel_spread < 12.0
+    return bool(channel_spread < 12.0)
+
+
+# Backwards-compatible alias
+looks_like_xray = looks_like_medical_scan
 
 
 def load_and_preprocess(image_bytes: bytes):
@@ -106,55 +227,9 @@ def load_and_preprocess(image_bytes: bytes):
     return arr, img
 
 
-def predict(arr: np.ndarray) -> dict:
-    model = get_model()
-    probs = model.predict(arr, verbose=0)[0]  # shape (3,)
-    class_idx = int(np.argmax(probs))
-    label = CLASS_NAMES[class_idx]
-    confidence = float(probs[class_idx])
-    return {
-        "prediction": label,
-        "confidence": round(confidence * 100, 2),
-        "class_probabilities": {
-            CLASS_NAMES[i]: round(float(probs[i]) * 100, 2) for i in range(len(CLASS_NAMES))
-        },
-    }
+def predict(arr: np.ndarray, modality: Modality = "xray") -> dict:
+    return get_bundle(modality).predict(arr)
 
 
-def generate_gradcam(arr: np.ndarray) -> str:
-    """Run Grad-CAM (against the predicted class) and return a base64-encoded PNG overlay."""
-    last_conv_layer_model, classifier_model = _get_gradcam_submodels()
-
-    with tf.GradientTape() as tape:
-        conv_outputs = last_conv_layer_model(arr)
-        tape.watch(conv_outputs)
-        predictions = classifier_model(conv_outputs)
-        class_idx = tf.argmax(predictions[0])
-        loss = predictions[:, class_idx]
-
-    grads = tape.gradient(loss, conv_outputs)
-    pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
-
-    conv_outputs = conv_outputs[0]
-    heatmap = conv_outputs @ pooled_grads[..., tf.newaxis]
-    heatmap = tf.squeeze(heatmap)
-    heatmap = tf.maximum(heatmap, 0) / (tf.math.reduce_max(heatmap) + 1e-8)
-    heatmap = heatmap.numpy()
-
-    heatmap_img = Image.fromarray(np.uint8(255 * heatmap)).resize(IMG_SIZE)
-    heatmap_arr = np.array(heatmap_img)
-
-    colored = np.zeros((*IMG_SIZE, 3), dtype=np.uint8)
-    colored[..., 0] = heatmap_arr
-    colored[..., 1] = (heatmap_arr * 0.3).astype(np.uint8)
-    heatmap_rgba = Image.fromarray(colored).convert("RGBA")
-
-    alpha = Image.fromarray(np.uint8(heatmap_arr * 0.6))
-    heatmap_rgba.putalpha(alpha)
-
-    orig_img = Image.fromarray(np.uint8(arr[0] * 255)).convert("RGBA").resize(IMG_SIZE)
-    overlay = Image.alpha_composite(orig_img, heatmap_rgba).convert("RGB")
-
-    buf = io.BytesIO()
-    overlay.save(buf, format="PNG")
-    return base64.b64encode(buf.getvalue()).decode("utf-8")
+def generate_gradcam(arr: np.ndarray, modality: Modality = "xray") -> str:
+    return get_bundle(modality).generate_gradcam(arr)
