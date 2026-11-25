@@ -17,12 +17,16 @@ from . import model_utils
 
 app = FastAPI(title="MedVision API", version="2.1.0")
 
-ALLOWED_ORIGINS = os.environ.get("MEDVISION_ALLOWED_ORIGINS", "*").split(",")
+ALLOWED_ORIGINS = [
+    origin.strip()
+    for origin in os.environ.get("MEDVISION_ALLOWED_ORIGINS", "*").split(",")
+    if origin.strip()
+] or ["*"]
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
-    allow_credentials=True,
+    allow_credentials="*" not in ALLOWED_ORIGINS,
     allow_methods=["*"],
     allow_headers=["*"],
 )

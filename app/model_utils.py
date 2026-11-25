@@ -46,6 +46,7 @@ Modality = Literal["xray", "ct"]
 
 MODEL_DIR = os.path.join(os.path.dirname(__file__), "..", "model")
 IMG_SIZE = (224, 224)
+Image.MAX_IMAGE_PIXELS = 25_000_000
 _MODEL_LOCK = threading.Lock()
 
 
