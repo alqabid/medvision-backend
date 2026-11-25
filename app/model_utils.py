@@ -31,8 +31,10 @@ Preprocessing: resize to 224x224 RGB, rescale to [0, 1] (not preprocess_input).
 
 import base64
 from dataclasses import dataclass, field
+import gc
 import io
 import os
+import threading
 from typing import Literal
 
 import numpy as np
@@ -44,6 +46,7 @@ Modality = Literal["xray", "ct"]
 
 MODEL_DIR = os.path.join(os.path.dirname(__file__), "..", "model")
 IMG_SIZE = (224, 224)
+_MODEL_LOCK = threading.Lock()
 
 
 @dataclass
@@ -62,17 +65,30 @@ class ModelBundle:
     def exists(self) -> bool:
         return os.path.isfile(self.model_path)
 
+    def unload(self) -> None:
+        self._model = None
+        self._last_conv_layer_model = None
+        self._classifier_model = None
+
     def get_model(self) -> keras.Model:
         if not self.exists():
-            self._model = None
-            self._last_conv_layer_model = None
-            self._classifier_model = None
+            self.unload()
             raise FileNotFoundError(
                 f"Model file for modality '{self.modality}' not found at {self.model_path}"
             )
-        if self._model is None:
-            self._model = keras.models.load_model(self.model_path, compile=False)
-        return self._model
+        with _MODEL_LOCK:
+            if self._model is None:
+                # Keep at most one TensorFlow model in memory at a time (Render 512MB limit)
+                evicted = False
+                for other_modality, other_bundle in BUNDLES.items():
+                    if other_modality != self.modality and other_bundle._model is not None:
+                        other_bundle.unload()
+                        evicted = True
+                if evicted:
+                    keras.backend.clear_session()
+                    gc.collect()
+                self._model = keras.models.load_model(self.model_path, compile=False)
+            return self._model
 
     def _get_gradcam_submodels(self) -> tuple[keras.Model, keras.Model]:
         """

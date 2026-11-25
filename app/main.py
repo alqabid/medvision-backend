@@ -40,11 +40,6 @@ class PredictResponse(BaseModel):
     model_used: str
 
 
-@app.on_event("startup")
-def _warm_up_models():
-    model_utils.warm_up_available_models()
-
-
 @app.get("/health")
 def health():
     return {
